@@ -15,6 +15,10 @@
 #include "../../display/lv_display_private.h"
 #include "../../lv_init.h"
 
+/* for aligned_alloc */
+#define __USE_ISOC11
+#include <stdlib.h>
+
 #define SDL_MAIN_HANDLED /*To fix SDL's "undefined reference to WinMain" issue*/
 #include LV_SDL_INCLUDE_PATH
 
@@ -49,12 +53,15 @@ typedef struct {
 /**********************
  *  STATIC PROTOTYPES
  **********************/
+static inline int sdl_render_mode(void);
 static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p);
 static void window_create(lv_display_t * disp);
 static void window_update(lv_display_t * disp);
 #if LV_USE_DRAW_SDL == 0
     static void texture_resize(lv_display_t * disp);
 #endif
+static void * sdl_draw_buf_realloc_aligned(void * ptr, size_t new_size);
+static void sdl_draw_buf_free(void * ptr);
 static void sdl_event_handler(lv_timer_t * t);
 static void release_disp_cb(lv_event_t * e);
 
@@ -118,10 +125,10 @@ lv_display_t * lv_sdl_window_create(int32_t hor_res, int32_t ver_res)
     lv_display_set_flush_cb(disp, flush_cb);
 
 #if LV_USE_DRAW_SDL == 0
-    if(LV_SDL_RENDER_MODE == LV_DISPLAY_RENDER_MODE_PARTIAL) {
-        dsc->buf1 = malloc(32 * 1024);
+    if(sdl_render_mode() == LV_DISPLAY_RENDER_MODE_PARTIAL) {
+        dsc->buf1 = sdl_draw_buf_realloc_aligned(NULL, 32 * 1024);
 #if LV_SDL_BUF_COUNT == 2
-        dsc->buf2 = malloc(32 * 1024);
+        dsc->buf2 = sdl_draw_buf_realloc_aligned(NULL, 32 * 1024);
 #endif
         lv_display_set_buffers(disp, dsc->buf1, dsc->buf2,
                                32 * 1024, LV_DISPLAY_RENDER_MODE_PARTIAL);
@@ -207,13 +214,19 @@ void lv_sdl_quit()
  *   STATIC FUNCTIONS
  **********************/
 
+static inline int sdl_render_mode(void)
+{
+    return LV_SDL_RENDER_MODE;
+}
+
 static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * px_map)
 {
 #if LV_USE_DRAW_SDL == 0
+    lv_area_t rotated_area;
     lv_sdl_window_t * dsc = lv_display_get_driver_data(disp);
     lv_color_format_t cf = lv_display_get_color_format(disp);
 
-    if(LV_SDL_RENDER_MODE == LV_DISPLAY_RENDER_MODE_PARTIAL) {
+    if(sdl_render_mode() == LV_DISPLAY_RENDER_MODE_PARTIAL) {
         lv_display_rotation_t rotation = lv_display_get_rotation(disp);
         uint32_t px_size = lv_color_format_get_size(cf);
 
@@ -226,7 +239,7 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * px_m
 
             /* (Re)allocate temporary buffer if needed */
             if(!dsc->rotated_buf || dsc->rotated_buf_size != buf_size) {
-                dsc->rotated_buf = realloc(dsc->rotated_buf, buf_size);
+                dsc->rotated_buf = sdl_draw_buf_realloc_aligned(dsc->rotated_buf, buf_size);
                 dsc->rotated_buf_size = buf_size;
             }
 
@@ -246,7 +259,9 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * px_m
 
             px_map = dsc->rotated_buf;
 
-            lv_display_rotate_area(disp, (lv_area_t *)area);
+            rotated_area = *area;
+            lv_display_rotate_area(disp, &rotated_area);
+            area = &rotated_area;
         }
 
         uint32_t px_map_stride = lv_draw_buf_width_to_stride(lv_area_get_width(area), cf);
@@ -268,7 +283,7 @@ static void flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * px_m
     /* TYPICALLY YOU DO NOT NEED THIS
      * If it was the last part to refresh update the texture of the window.*/
     if(lv_display_flush_is_last(disp)) {
-        if(LV_SDL_RENDER_MODE != LV_DISPLAY_RENDER_MODE_PARTIAL) {
+        if(sdl_render_mode() != LV_DISPLAY_RENDER_MODE_PARTIAL) {
             dsc->fb_act = px_map;
         }
         window_update(disp);
@@ -391,15 +406,15 @@ static void texture_resize(lv_display_t * disp)
     uint32_t stride = lv_draw_buf_width_to_stride(disp->hor_res, lv_display_get_color_format(disp));
     lv_sdl_window_t * dsc = lv_display_get_driver_data(disp);
 
-    dsc->fb1 = realloc(dsc->fb1, stride * disp->ver_res);
+    dsc->fb1 = sdl_draw_buf_realloc_aligned(dsc->fb1, stride * disp->ver_res);
     lv_memzero(dsc->fb1, stride * disp->ver_res);
 
-    if(LV_SDL_RENDER_MODE == LV_DISPLAY_RENDER_MODE_PARTIAL) {
+    if(sdl_render_mode() == LV_DISPLAY_RENDER_MODE_PARTIAL) {
         dsc->fb_act = dsc->fb1;
     }
     else {
 #if LV_SDL_BUF_COUNT == 2
-        dsc->fb2 = realloc(dsc->fb2, stride * disp->ver_res);
+        dsc->fb2 = sdl_draw_buf_realloc_aligned(dsc->fb2, stride * disp->ver_res);
         memset(dsc->fb2, 0x00, stride * disp->ver_res);
 #endif
         lv_display_set_buffers(disp, dsc->fb1, dsc->fb2, stride * disp->ver_res, LV_SDL_RENDER_MODE);
@@ -423,6 +438,31 @@ static void texture_resize(lv_display_t * disp)
     SDL_SetTextureBlendMode(dsc->texture, SDL_BLENDMODE_BLEND);
 }
 #endif
+
+static void * sdl_draw_buf_realloc_aligned(void * ptr, size_t new_size)
+{
+    if(ptr) {
+        sdl_draw_buf_free(ptr);
+    }
+
+    /* No need copy for drawing buffer */
+
+#ifndef _WIN32
+    /* Size must be multiple of align, See: https://en.cppreference.com/w/c/memory/aligned_alloc */
+    return aligned_alloc(LV_DRAW_BUF_ALIGN, LV_ALIGN_UP(new_size, LV_DRAW_BUF_ALIGN));
+#else
+    return _aligned_malloc(LV_ALIGN_UP(new_size, LV_DRAW_BUF_ALIGN), LV_DRAW_BUF_ALIGN);
+#endif /* _WIN32 */
+}
+
+static void sdl_draw_buf_free(void * ptr)
+{
+#ifndef _WIN32
+    free(ptr);
+#else
+    _aligned_free(ptr);
+#endif /* _WIN32 */
+}
 
 static void res_chg_event_cb(lv_event_t * e)
 {
@@ -453,10 +493,10 @@ static void release_disp_cb(lv_event_t * e)
     SDL_DestroyRenderer(dsc->renderer);
     SDL_DestroyWindow(dsc->window);
 #if LV_USE_DRAW_SDL == 0
-    if(dsc->fb1) free(dsc->fb1);
-    if(dsc->fb2) free(dsc->fb2);
-    if(dsc->buf1) free(dsc->buf1);
-    if(dsc->buf2) free(dsc->buf2);
+    if(dsc->fb1) sdl_draw_buf_free(dsc->fb1);
+    if(dsc->fb2) sdl_draw_buf_free(dsc->fb2);
+    if(dsc->buf1) sdl_draw_buf_free(dsc->buf1);
+    if(dsc->buf2) sdl_draw_buf_free(dsc->buf2);
 #endif
     lv_free(dsc);
     lv_display_set_driver_data(disp, NULL);
